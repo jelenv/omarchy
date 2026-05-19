@@ -100,6 +100,21 @@ default_resolution() {
   fi
 }
 
+gsr_monitor_visible() {
+  gpu-screen-recorder --list-monitors 2>/dev/null | cut -d"|" -f1 | grep -Fxq "$1"
+}
+
+gsr_monitor_visible_with_nvidia_prime() {
+  omarchy-hw-nvidia || return 1
+
+  __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia \
+    gpu-screen-recorder --list-monitors 2>/dev/null | cut -d"|" -f1 | grep -Fxq "$1"
+}
+
+gsr_monitor_visible_only_with_nvidia_prime() {
+  ! gsr_monitor_visible "$1" && gsr_monitor_visible_with_nvidia_prime "$1"
+}
+
 # Monitor + window rectangles on the focused workspace, in slurp's "X,Y WxH" format.
 # Mirrors omarchy-capture-screenshot so the picker UX is identical.
 get_rectangles() {
@@ -145,11 +160,31 @@ select_capture_target() {
 
   # When the selection exactly matches a monitor, prefer -w <monitor> over a
   # region capture — same kms backend, but no scaling math and full native res.
+  # On hybrid GPU laptops, gpu-screen-recorder may only see external dGPU outputs
+  # when launched with NVIDIA PRIME offload enabled.
   local monitor=$(hyprctl monitors -j | jq -r --argjson x "$sx" --argjson y "$sy" --argjson w "$sw" --argjson h "$sh" '
     .[] | select(.x == $x and .y == $y and (.width / .scale | floor) == $w and (.height / .scale | floor) == $h) | .name' | head -1)
 
   if [[ -n $monitor ]]; then
-    echo "monitor:$monitor"
+    if gsr_monitor_visible "$monitor"; then
+      echo "monitor:$monitor"
+    elif gsr_monitor_visible_with_nvidia_prime "$monitor"; then
+      echo "nvidia-monitor:$monitor"
+    else
+      echo "region:${sw}x${sh}+${sx}+${sy}"
+    fi
+    return
+  fi
+
+  local region_monitor=$(hyprctl monitors -j | jq -r --argjson x "$sx" --argjson y "$sy" --argjson w "$sw" --argjson h "$sh" '
+    .[] | select(
+      $x >= .x and $y >= .y and
+      ($x + $w) <= (.x + (.width / .scale | floor)) and
+      ($y + $h) <= (.y + (.height / .scale | floor))
+    ) | .name' | head -1)
+
+  if [[ -n $region_monitor ]] && gsr_monitor_visible_only_with_nvidia_prime "$region_monitor"; then
+    echo "nvidia-region:${sw}x${sh}+${sx}+${sy}"
     return
   fi
 
@@ -176,6 +211,17 @@ start_screenrecording() {
     case $target in
     monitor:*)
       capture_args=(-w "${target#monitor:}" -s "${RESOLUTION:-$(default_resolution)}")
+      ;;
+    nvidia-monitor:*)
+      export __NV_PRIME_RENDER_OFFLOAD=1
+      export __GLX_VENDOR_LIBRARY_NAME=nvidia
+      capture_args=(-w "${target#nvidia-monitor:}" -s "${RESOLUTION:-$(default_resolution)}")
+      ;;
+    nvidia-region:*)
+      export __NV_PRIME_RENDER_OFFLOAD=1
+      export __GLX_VENDOR_LIBRARY_NAME=nvidia
+      capture_args=(-w "${target#nvidia-region:}")
+      [[ -n $RESOLUTION ]] && capture_args+=(-s "$RESOLUTION")
       ;;
     region:*)
       capture_args=(-w "${target#region:}")
